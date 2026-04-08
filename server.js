@@ -1,46 +1,49 @@
-// server.js - Meme Maker Backend with Working MongoDB Connection
-const express = require('express');
-const mongoose = require('mongoose');
-const cors = require('cors');
-const session = require('express-session');
-const bcrypt = require('bcryptjs');
-const path = require('path');
-const fs = require('fs');
-const multer = require('multer');
+import express from 'express';
+import mongoose from 'mongoose';
+import cors from 'cors';
+import session from 'express-session';
+import bcrypt from 'bcryptjs';
+import path from 'path';
+import fs from 'fs';
+import multer from 'multer';
+import { fileURLToPath } from 'url';
+import OpenAI from 'openai';
+import dotenv from 'dotenv';
+
+dotenv.config();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
+const PORT = process.env.PORT || 5000;
 
-// ============ CONFIGURATION ============
-const PORT = 5000;
-const SESSION_SECRET = 'meme-maker-secret-2024';
+// Initialize DMXAPI client (OpenAI-compatible)
+const dmxai = new OpenAI({
+    baseURL: 'https://ssvip.dmxapi.com/v1',
+    apiKey: process.env.DMXAPI_KEY,
+});
 
 // Create upload directories
-const uploadDirs = ['./uploads', './uploads/profiles', './uploads/memes'];
+const uploadDirs = ['./uploads', './uploads/profiles', './uploads/memes', './uploads/templates', './uploads/gifs'];
 uploadDirs.forEach(dir => {
     if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
     }
 });
 
-// ============ MIDDLEWARE ============
-app.use(cors({
-    origin: 'http://localhost:3000',
-    credentials: true
-}));
-app.use(express.json());
+// Middleware
+app.use(cors({ origin: 'http://localhost:3000', credentials: true }));
+app.use(express.json({ limit: '50mb' }));
 app.use('/uploads', express.static('uploads'));
-
 app.use(session({
-    secret: SESSION_SECRET,
+    secret: 'meme-maker-secret',
     resave: false,
     saveUninitialized: false,
-    cookie: {
-        maxAge: 1000 * 60 * 60 * 24,
-        httpOnly: true
-    }
+    cookie: { maxAge: 24 * 60 * 60 * 1000 }
 }));
 
-// ============ DATABASE MODELS ============
+// ========== SCHEMAS ==========
 const userSchema = new mongoose.Schema({
     username: { type: String, required: true, unique: true, trim: true, minlength: 3 },
     email: { type: String, required: true, unique: true, lowercase: true },
@@ -53,13 +56,24 @@ const memeSchema = new mongoose.Schema({
     userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
     imageUrl: { type: String, required: true },
     title: { type: String, default: 'My Meme' },
-    texts: [{
-        content: String,
-        x: Number,
-        y: Number,
-        fontSize: Number,
-        color: String
-    }],
+    texts: [{ content: String, x: Number, y: Number, fontSize: Number, color: String }],
+    likes: { type: Number, default: 0 },
+    views: { type: Number, default: 0 },
+    createdAt: { type: Date, default: Date.now }
+});
+
+const templateSchema = new mongoose.Schema({
+    name: String,
+    imageUrl: String,
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    createdAt: { type: Date, default: Date.now }
+});
+
+const gifMemeSchema = new mongoose.Schema({
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    gifUrl: { type: String, required: true },
+    title: { type: String, default: 'My GIF Meme' },
+    texts: [{ content: String, x: Number, y: Number, fontSize: Number, color: String }],
     likes: { type: Number, default: 0 },
     views: { type: Number, default: 0 },
     createdAt: { type: Date, default: Date.now }
@@ -67,276 +81,316 @@ const memeSchema = new mongoose.Schema({
 
 const User = mongoose.model('User', userSchema);
 const Meme = mongoose.model('Meme', memeSchema);
+const Template = mongoose.model('Template', templateSchema);
+const GifMeme = mongoose.model('GifMeme', gifMemeSchema);
 
-// ============ MULTER CONFIGURATION ============
-const imageStorage = multer.diskStorage({
-    destination: (req, file, cb) => {
-        cb(null, './uploads/memes');
-    },
-    filename: (req, file, cb) => {
-        cb(null, 'meme-' + Date.now() + path.extname(file.originalname));
+// ========== MULTER CONFIGURATIONS ==========
+const uploadImage = multer({
+    storage: multer.diskStorage({
+        destination: './uploads/memes',
+        filename: (req, file, cb) => cb(null, 'meme-' + Date.now() + path.extname(file.originalname))
+    })
+});
+
+const uploadProfile = multer({
+    storage: multer.diskStorage({
+        destination: './uploads/profiles',
+        filename: (req, file, cb) => cb(null, 'profile-' + Date.now() + path.extname(file.originalname))
+    })
+});
+
+const uploadTemplate = multer({
+    storage: multer.diskStorage({
+        destination: './uploads/templates',
+        filename: (req, file, cb) => cb(null, 'template-' + Date.now() + path.extname(file.originalname))
+    })
+});
+
+const uploadGif = multer({
+    storage: multer.diskStorage({
+        destination: './uploads/gifs',
+        filename: (req, file, cb) => cb(null, 'gif-' + Date.now() + '.gif')
+    }),
+    limits: { fileSize: 10 * 1024 * 1024 },
+    fileFilter: (req, file, cb) => {
+        if (file.mimetype === 'image/gif') {
+            cb(null, true);
+        } else {
+            cb(new Error('Only GIF files are allowed'), false);
+        }
     }
 });
 
-const profileStorage = multer.diskStorage({
-    destination: (req, file, cb) => {
-        cb(null, './uploads/profiles');
-    },
-    filename: (req, file, cb) => {
-        cb(null, 'profile-' + Date.now() + path.extname(file.originalname));
-    }
-});
+// ========== FALLBACK CAPTIONS ==========
+function getFallbackCaptions() {
+    const fallbacks = [
+        "When you realize it's Monday tomorrow 😂",
+        "That moment when expectations meet reality",
+        "POV: You're trying your best",
+        "Nobody: ... Me:",
+        "This is fine 🔥 Everything is fine",
+        "I understood that reference!",
+        "Math is math!",
+        "Why are you running? WHY ARE YOU RUNNING?",
+        "Modern problems require modern solutions",
+        "Trust me, I'm an expert",
+        "That's what she said!",
+        "I'll pretend I didn't see that",
+        "My brain trying to remember what I walked into the room for",
+        "When the code works but you don't know why",
+        "Me explaining my sleep schedule to anyone who asks"
+    ];
+    return fallbacks.sort(() => 0.5 - Math.random()).slice(0, 5);
+}
 
-const uploadImage = multer({ storage: imageStorage, limits: { fileSize: 5 * 1024 * 1024 } });
-const uploadProfile = multer({ storage: profileStorage, limits: { fileSize: 2 * 1024 * 1024 } });
-
-// ============ TEMPLATES ============
-const templates = [
-    { id: 1, url: '/templates/drake.jpg', name: 'Drake' },
-    { id: 2, url: '/templates/distracted.jpg', name: 'Distracted Boyfriend' },
-    { id: 3, url: '/templates/disaster.jpg', name: 'Disaster Girl' },
-    { id: 4, url: '/templates/change.jpg', name: 'Change My Mind' }
-];
-
-// ============ API ROUTES ============
-
-// Test route
-app.get('/api/test', (req, res) => {
-    res.json({ message: 'Meme Maker API is running!' });
-});
-
-// Get templates
-app.get('/api/templates', (req, res) => {
-    res.json(templates);
-});
-
-// Upload image
-app.post('/api/upload', uploadImage.single('image'), (req, res) => {
-    if (!req.file) {
-        return res.status(400).json({ message: 'No file uploaded' });
-    }
-    res.json({ url: `/uploads/memes/${req.file.filename}` });
-});
-
-// ============ AUTH ROUTES ============
-
-// Register
+// ========== AUTH ROUTES ==========
 app.post('/api/register', async (req, res) => {
     try {
         const { username, email, password } = req.body;
-        
-        if (!username || !email || !password) {
-            return res.status(400).json({ message: 'All fields are required' });
-        }
-
-        const existingUser = await User.findOne({ $or: [{ email }, { username }] });
-        if (existingUser) {
+        if (await User.findOne({ $or: [{ email }, { username }] })) {
             return res.status(400).json({ message: 'User already exists' });
         }
-
-        const hashedPassword = await bcrypt.hash(password, 10);
-        const user = new User({ username, email, password: hashedPassword });
+        const user = new User({ username, email, password: await bcrypt.hash(password, 10) });
         await user.save();
-
         req.session.userId = user._id;
         req.session.username = user.username;
-
-        res.status(201).json({
-            message: 'User created successfully',
-            user: { id: user._id, username: user.username, email: user.email }
-        });
+        res.status(201).json({ user: { id: user._id, username, email } });
     } catch (error) {
-        console.error('Registration error:', error);
         res.status(500).json({ message: error.message });
     }
 });
 
-// Login
 app.post('/api/login', async (req, res) => {
     try {
         const { email, password } = req.body;
-        
         const user = await User.findOne({ email });
-        if (!user) {
+        if (!user || !(await bcrypt.compare(password, user.password))) {
             return res.status(400).json({ message: 'Invalid credentials' });
         }
-
-        const validPassword = await bcrypt.compare(password, user.password);
-        if (!validPassword) {
-            return res.status(400).json({ message: 'Invalid credentials' });
-        }
-
         req.session.userId = user._id;
         req.session.username = user.username;
-
-        res.json({
-            message: 'Login successful',
-            user: { id: user._id, username: user.username, email: user.email }
-        });
+        res.json({ user: { id: user._id, username: user.username, email: user.email } });
     } catch (error) {
         res.status(500).json({ message: error.message });
     }
 });
 
-// Guest login
 app.post('/api/guest-login', (req, res) => {
     const guestId = 'guest-' + Date.now();
     req.session.userId = guestId;
     req.session.username = 'Guest';
     req.session.isGuest = true;
-    
-    res.json({
-        message: 'Guest login successful',
-        user: { id: guestId, username: 'Guest', isGuest: true }
-    });
+    res.json({ user: { id: guestId, username: 'Guest', isGuest: true } });
 });
 
-// Logout
 app.post('/api/logout', (req, res) => {
     req.session.destroy();
-    res.json({ message: 'Logout successful' });
+    res.json({ message: 'Logged out' });
 });
 
-// Get current user
 app.get('/api/me', async (req, res) => {
     if (!req.session.userId) {
         return res.status(401).json({ message: 'Not authenticated' });
     }
-    
-    try {
-        if (req.session.isGuest) {
-            return res.json({ id: req.session.userId, username: 'Guest', isGuest: true });
-        }
-        
-        const user = await User.findById(req.session.userId).select('-password');
-        if (!user) {
-            return res.status(401).json({ message: 'User not found' });
-        }
-        res.json(user);
-    } catch (error) {
-        res.status(500).json({ message: error.message });
+    if (req.session.isGuest) {
+        return res.json({ id: req.session.userId, username: 'Guest', isGuest: true });
     }
+    const user = await User.findById(req.session.userId).select('-password');
+    res.json(user);
 });
 
-// Update profile
-app.put('/api/profile', uploadProfile.single('profilePicture'), async (req, res) => {
-    try {
-        if (req.session.isGuest) {
-            return res.status(403).json({ message: 'Guests cannot update profile' });
-        }
-        
-        const updates = {};
-        if (req.body.username) updates.username = req.body.username;
-        if (req.body.email) updates.email = req.body.email;
-        if (req.file) updates.profilePicture = req.file.filename;
-        
-        const user = await User.findByIdAndUpdate(req.session.userId, updates, { new: true }).select('-password');
-        res.json(user);
-    } catch (error) {
-        res.status(500).json({ message: error.message });
-    }
+// ========== MEME ROUTES ==========
+app.post('/api/upload', uploadImage.single('image'), (req, res) => {
+    if (!req.file) return res.status(400).json({ message: 'No file' });
+    res.json({ url: `/uploads/memes/${req.file.filename}` });
 });
 
-// ============ MEME ROUTES ============
-
-// Save meme
 app.post('/api/memes', async (req, res) => {
-    try {
-        if (!req.session.userId || req.session.isGuest) {
-            return res.status(403).json({ message: 'Please login to save memes' });
-        }
-        
-        const meme = new Meme({
-            userId: req.session.userId,
-            ...req.body
-        });
-        
-        await meme.save();
-        res.status(201).json(meme);
-    } catch (error) {
-        res.status(500).json({ message: error.message });
+    if (!req.session.userId || req.session.isGuest) {
+        return res.status(403).json({ message: 'Login to save' });
     }
+    const meme = new Meme({ userId: req.session.userId, ...req.body });
+    await meme.save();
+    res.status(201).json(meme);
 });
 
-// Get user's memes
 app.get('/api/my-memes', async (req, res) => {
+    if (!req.session.userId || req.session.isGuest) return res.json([]);
+    const memes = await Meme.find({ userId: req.session.userId }).sort({ createdAt: -1 });
+    res.json(memes);
+});
+
+app.get('/api/trending', async (req, res) => {
+    const memes = await Meme.find().sort({ likes: -1, views: -1 }).limit(10).populate('userId', 'username');
+    res.json(memes);
+});
+
+app.post('/api/memes/:id/like', async (req, res) => {
+    const meme = await Meme.findById(req.params.id);
+    if (!meme) return res.status(404).json({ message: 'Not found' });
+    meme.likes += 1;
+    await meme.save();
+    res.json({ likes: meme.likes });
+});
+
+// ========== AI CAPTION GENERATION (DMXAPI) ==========
+app.post('/api/ai-caption-vision', async (req, res) => {
     try {
-        if (!req.session.userId || req.session.isGuest) {
-            return res.json([]);
+        const { imageBase64, customPrompt } = req.body;
+        
+        // If no API key, use fallback
+        if (!process.env.DMXAPI_KEY) {
+            console.log('DMXAPI key not configured, using fallback captions');
+            return res.json({ success: false, suggestions: getFallbackCaptions() });
         }
         
-        const memes = await Meme.find({ userId: req.session.userId }).sort({ createdAt: -1 });
-        res.json(memes);
-    } catch (error) {
-        res.status(500).json({ message: error.message });
-    }
-});
-
-// Get trending memes
-app.get('/api/trending', async (req, res) => {
-    try {
-        const memes = await Meme.find().sort({ likes: -1, views: -1 }).limit(10).populate('userId', 'username');
-        res.json(memes);
-    } catch (error) {
-        res.status(500).json({ message: error.message });
-    }
-});
-
-// Like a meme
-app.post('/api/memes/:id/like', async (req, res) => {
-    try {
-        const meme = await Meme.findById(req.params.id);
-        if (!meme) return res.status(404).json({ message: 'Meme not found' });
+        // If no image, use text-only prompt
+        let prompt = customPrompt || `Generate 5 funny, creative meme captions. 
         
-        meme.likes += 1;
-        await meme.save();
-        res.json({ likes: meme.likes });
+Requirements:
+- Each caption short (under 15 words)
+- Make them clever and relatable
+- Return ONLY the 5 captions, one per line
+- Do not number them
+- Do not add any extra text or explanations`;
+
+        let response;
+        
+        if (imageBase64) {
+            // Vision request with image
+            response = await dmxai.chat.completions.create({
+                model: 'glm-4.1v-thinking-flash',
+                messages: [
+                    {
+                        role: 'user',
+                        content: [
+                            {
+                                type: 'text',
+                                text: customPrompt || `Analyze this image and generate 5 funny, creative meme captions. Consider what's happening, expressions, objects, and any text visible. Return ONLY the 5 captions, one per line, no numbers, no extra text.`
+                            },
+                            {
+                                type: 'image_url',
+                                image_url: { url: `data:image/jpeg;base64,${imageBase64}` }
+                            }
+                        ]
+                    }
+                ],
+                max_tokens: 300,
+            });
+        } else {
+            // Text-only request
+            response = await dmxai.chat.completions.create({
+                model: 'kimi-k2.5-free',
+                messages: [
+                    {
+                        role: 'user',
+                        content: prompt
+                    }
+                ],
+                max_tokens: 300,
+            });
+        }
+        
+        const text = response.choices[0].message.content;
+        
+        // Parse the response into individual captions
+        let suggestions = text.split('\n')
+            .filter(line => line.trim().length > 0 && line.trim().length < 100)
+            .map(line => line.replace(/^\d+\.\s*/, '').replace(/^-\s*/, '').replace(/^\*\s*/, '').trim())
+            .slice(0, 5);
+        
+        if (suggestions.length < 2) {
+            suggestions = getFallbackCaptions();
+        }
+        
+        res.json({ success: true, suggestions });
+        
     } catch (error) {
-        res.status(500).json({ message: error.message });
+        console.error('DMXAPI Error:', error.message);
+        // Fallback to random captions
+        res.json({ success: false, suggestions: getFallbackCaptions() });
     }
 });
 
-// AI Caption Suggestion
-app.post('/api/ai-caption', (req, res) => {
-    const suggestions = [
-        "When you realize it's Monday tomorrow 😂",
-        "That moment when...",
-        "Expectation vs Reality",
-        "Me explaining my meme to grandma",
-        "POV: You're trying to be productive",
-        "Nobody: \nMe:",
-        "This is fine 🔥",
-        "I understood that reference!",
-        "Math is math!",
-        "Why are you running? WHY ARE YOU RUNNING?"
-    ];
-    
-    const randomSuggestions = suggestions.sort(() => 0.5 - Math.random()).slice(0, 5);
-    res.json({ suggestions: randomSuggestions });
+// ========== TEMPLATE ROUTES ==========
+app.get('/api/templates', async (req, res) => {
+    if (!req.session.userId || req.session.isGuest) return res.json([]);
+    const templates = await Template.find({ userId: req.session.userId }).sort({ createdAt: -1 });
+    res.json(templates.map(t => ({ id: t._id, url: t.imageUrl, name: t.name })));
 });
 
-// ============ DATABASE CONNECTION ============
-// USING YOUR WORKING CONNECTION STRING
-const MONGODB_URI = 'mongodb+srv://meme_user:test123@cluster0.d8es2s1.mongodb.net/meme-maker?retryWrites=true&w=majority';
-
-console.log('🎨 Meme Maker Backend Starting...');
-console.log('🔄 Connecting to MongoDB Atlas...');
-console.log('📊 Database: meme-maker');
-
-mongoose.connect(MONGODB_URI)
-.then(() => {
-    console.log('✅ MongoDB Atlas connected successfully!');
-    console.log('🎉 Meme Maker database is ready!');
-    app.listen(PORT, () => {
-        console.log(`🚀 Server running on http://localhost:${PORT}`);
-        console.log(`📁 Uploads folder: ${path.join(__dirname, 'uploads')}`);
-        console.log('\n✨ Meme Maker is ready!');
-        console.log('📍 Frontend should run on: http://localhost:3000');
-        console.log('📍 Test API: http://localhost:5000/api/test');
+app.post('/api/templates/upload', uploadTemplate.single('image'), async (req, res) => {
+    if (!req.session.userId || req.session.isGuest) {
+        return res.status(401).json({ message: 'Login required' });
+    }
+    if (!req.file) return res.status(400).json({ message: 'No file' });
+    const { name } = req.body;
+    const template = new Template({
+        name: name || 'Custom Template',
+        imageUrl: `/uploads/templates/${req.file.filename}`,
+        userId: req.session.userId
     });
-})
-.catch(err => {
-    console.error('❌ MongoDB connection error:', err);
-    console.log('\n💡 Check your connection string in server.js');
-    process.exit(1);
+    await template.save();
+    res.status(201).json({ template: { id: template._id, name: template.name, url: template.imageUrl } });
 });
+
+app.delete('/api/templates/:id', async (req, res) => {
+    if (!req.session.userId || req.session.isGuest) {
+        return res.status(401).json({ message: 'Login required' });
+    }
+    const template = await Template.findById(req.params.id);
+    if (!template) return res.status(404).json({ message: 'Not found' });
+    if (template.userId.toString() !== req.session.userId) {
+        return res.status(403).json({ message: 'Not yours' });
+    }
+    const filePath = path.join(__dirname, template.imageUrl);
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    await template.deleteOne();
+    res.json({ message: 'Deleted' });
+});
+
+// ========== GIF MEME ROUTES ==========
+app.post('/api/upload-gif', uploadGif.single('gif'), (req, res) => {
+    if (!req.file) return res.status(400).json({ message: 'No GIF file uploaded' });
+    res.json({ url: `/uploads/gifs/${req.file.filename}`, type: 'gif' });
+});
+
+app.post('/api/gif-memes', async (req, res) => {
+    if (!req.session.userId || req.session.isGuest) {
+        return res.status(403).json({ message: 'Login to save GIF memes' });
+    }
+    const gifMeme = new GifMeme({ userId: req.session.userId, ...req.body });
+    await gifMeme.save();
+    res.status(201).json(gifMeme);
+});
+
+app.get('/api/my-gif-memes', async (req, res) => {
+    if (!req.session.userId || req.session.isGuest) return res.json([]);
+    const gifMemes = await GifMeme.find({ userId: req.session.userId }).sort({ createdAt: -1 });
+    res.json(gifMemes);
+});
+
+app.post('/api/gif-memes/:id/like', async (req, res) => {
+    const gifMeme = await GifMeme.findById(req.params.id);
+    if (!gifMeme) return res.status(404).json({ message: 'GIF meme not found' });
+    gifMeme.likes += 1;
+    await gifMeme.save();
+    res.json({ likes: gifMeme.likes });
+});
+
+// ========== HEALTH CHECK ==========
+app.get('/api/health', (req, res) => {
+    res.json({ status: 'OK', timestamp: new Date().toISOString() });
+});
+
+// ========== DATABASE CONNECTION ==========
+mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/meme-maker')
+    .then(() => {
+        console.log('✅ MongoDB connected');
+        app.listen(PORT, () => {
+            console.log(`🚀 Server running on port ${PORT}`);
+            console.log(`📁 Uploads directory: ${path.join(__dirname, 'uploads')}`);
+            console.log(`🤖 DMXAPI: ${process.env.DMXAPI_KEY ? 'Configured ✅' : 'Not configured ⚠️'}`);
+        });
+    })
+    .catch(err => console.error('MongoDB connection error:', err));
